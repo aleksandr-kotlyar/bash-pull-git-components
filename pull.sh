@@ -5,12 +5,20 @@ DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
 GIT_BASE_URL="${GIT_BASE_URL:-}"
 DRY_RUN=false
 MANIFEST_PATH=""
+CONTINUE_ON_ERROR=false
+TOTAL_REPOS=0
+SUCCESS_REPOS=0
+FAILED_REPOS=0
+FAILED_LIST=""
 
 fail() {
   local repo=$1
   local step=$2
   local details=${3:-}
   echo "Error: repo='${repo}' step='${step}' failed. ${details}" >&2
+  if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
+    return 1
+  fi
   exit 1
 }
 
@@ -24,13 +32,15 @@ run_step() {
   fi
   if ! "$@"; then
     fail "$repo" "$step"
+    return 1
   fi
+  return 0
 }
 
 print_help() {
   cat <<'EOF'
 Usage:
-  pull.sh --manifest <path> [--base-url <git-base-url>] [--default-branch <branch>] [--dry-run]
+  pull.sh --manifest <path> [--base-url <git-base-url>] [--default-branch <branch>] [--dry-run] [--continue-on-error]
   pull.sh <manifest-path>
 
 Options:
@@ -38,6 +48,7 @@ Options:
   --base-url <git-base-url> Base git URL, for example: git@github.com:your-org
   --default-branch <name>   Fallback branch when origin/HEAD is unavailable (default: master).
   --dry-run                 Print actions without running git commands.
+  --continue-on-error       Continue processing other repos and print summary at the end.
   -h, --help                Show this help message.
 EOF
 }
@@ -64,6 +75,10 @@ parse_args() {
         DRY_RUN=true
         shift
         ;;
+      --continue-on-error)
+        CONTINUE_ON_ERROR=true
+        shift
+        ;;
       -h|--help)
         print_help
         exit 0
@@ -83,6 +98,22 @@ parse_args() {
   done
 }
 
+record_failure() {
+  local repo=$1
+  local step=$2
+  FAILED_REPOS=$((FAILED_REPOS + 1))
+  FAILED_LIST+="${repo}:${step}"$'\n'
+}
+
+print_summary() {
+  echo "----- Summary -----"
+  echo "total=${TOTAL_REPOS} success=${SUCCESS_REPOS} failed=${FAILED_REPOS}"
+  if [[ $FAILED_REPOS -gt 0 ]]; then
+    echo "Failed repos:"
+    printf "%s" "$FAILED_LIST"
+  fi
+}
+
 sync_repo() {
   local repo=$1
   local ref=$2
@@ -95,6 +126,7 @@ sync_repo() {
   else
     if [[ -z "$GIT_BASE_URL" ]]; then
       fail "$repo" "clone" "Set GIT_BASE_URL, for example: export GIT_BASE_URL=git@github.com:your-org"
+      return 1
     fi
 
     echo "[$repo] cloning from ${GIT_BASE_URL}/${repo}.git"
@@ -126,6 +158,8 @@ sync_repo() {
 
 pull_components() {
   local manifest_path=${1:-}
+  local repo
+  local ref
 
   if [[ -z "$manifest_path" ]]; then
     echo "Usage: $0 <components.json>" >&2
@@ -147,9 +181,23 @@ pull_components() {
       continue
     fi
 
+    TOTAL_REPOS=$((TOTAL_REPOS + 1))
     echo "repo=$repo ref=${ref:-$DEFAULT_BRANCH}"
-    sync_repo "$repo" "$ref"
+    if sync_repo "$repo" "$ref"; then
+      SUCCESS_REPOS=$((SUCCESS_REPOS + 1))
+    else
+      record_failure "$repo" "sync"
+      if [[ "$CONTINUE_ON_ERROR" != "true" ]]; then
+        exit 1
+      fi
+      echo "[$repo] continue-on-error enabled, moving to next repository" >&2
+    fi
   done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$manifest_path")
+
+  print_summary
+  if [[ $FAILED_REPOS -gt 0 ]]; then
+    exit 1
+  fi
 }
 
 parse_args "$@"
