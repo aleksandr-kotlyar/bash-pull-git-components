@@ -25,10 +25,7 @@ sync_repo() {
   local repo=$1
   local ref=$2
   local target_ref=$ref
-
-  if [[ -z "$target_ref" ]]; then
-    target_ref="$DEFAULT_BRANCH"
-  fi
+  local remote_head_ref=""
 
   if [[ -d "$repo/.git" ]]; then
     echo "[$repo] existing repository found, fetching updates"
@@ -42,8 +39,27 @@ sync_repo() {
     run_step "$repo" "clone" git clone "${GIT_BASE_URL}/${repo}.git" "$repo"
   fi
 
-  echo "[$repo] checking out '${target_ref}'"
-  run_step "$repo" "checkout" git -C "$repo" checkout "$target_ref"
+  if [[ -n "$target_ref" ]]; then
+    echo "[$repo] checking out explicit ref '${target_ref}'"
+    run_step "$repo" "checkout" git -C "$repo" checkout "$target_ref"
+    return 0
+  fi
+
+  remote_head_ref=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  remote_head_ref=${remote_head_ref#origin/}
+
+  if [[ -n "$remote_head_ref" ]]; then
+    echo "[$repo] checking out detected default branch '${remote_head_ref}' from origin/HEAD"
+    if git -C "$repo" checkout "$remote_head_ref"; then
+      return 0
+    fi
+    echo "[$repo] warning: checkout of origin/HEAD target '${remote_head_ref}' failed, falling back" >&2
+  else
+    echo "[$repo] warning: origin/HEAD is not available, falling back to DEFAULT_BRANCH='${DEFAULT_BRANCH}'" >&2
+  fi
+
+  echo "[$repo] checking out fallback DEFAULT_BRANCH '${DEFAULT_BRANCH}'"
+  run_step "$repo" "checkout-default-branch" git -C "$repo" checkout "$DEFAULT_BRANCH"
 }
 
 pull_components() {
