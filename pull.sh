@@ -3,6 +3,8 @@ set -euo pipefail
 
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
 GIT_BASE_URL="${GIT_BASE_URL:-}"
+DRY_RUN=false
+MANIFEST_PATH=""
 
 fail() {
   local repo=$1
@@ -16,9 +18,69 @@ run_step() {
   local repo=$1
   local step=$2
   shift 2
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[$repo] dry-run step='${step}': $*"
+    return 0
+  fi
   if ! "$@"; then
     fail "$repo" "$step"
   fi
+}
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  pull.sh --manifest <path> [--base-url <git-base-url>] [--default-branch <branch>] [--dry-run]
+  pull.sh <manifest-path>
+
+Options:
+  --manifest <path>         Path to JSON manifest file.
+  --base-url <git-base-url> Base git URL, for example: git@github.com:your-org
+  --default-branch <name>   Fallback branch when origin/HEAD is unavailable (default: master).
+  --dry-run                 Print actions without running git commands.
+  -h, --help                Show this help message.
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --manifest)
+        [[ $# -lt 2 ]] && fail "cli" "parse-args" "Missing value for --manifest"
+        MANIFEST_PATH=$2
+        shift 2
+        ;;
+      --base-url)
+        [[ $# -lt 2 ]] && fail "cli" "parse-args" "Missing value for --base-url"
+        GIT_BASE_URL=$2
+        shift 2
+        ;;
+      --default-branch)
+        [[ $# -lt 2 ]] && fail "cli" "parse-args" "Missing value for --default-branch"
+        DEFAULT_BRANCH=$2
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+      -h|--help)
+        print_help
+        exit 0
+        ;;
+      --*)
+        fail "cli" "parse-args" "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$MANIFEST_PATH" ]]; then
+          MANIFEST_PATH=$1
+          shift
+        else
+          fail "cli" "parse-args" "Unexpected positional argument: $1"
+        fi
+        ;;
+    esac
+  done
 }
 
 sync_repo() {
@@ -90,4 +152,5 @@ pull_components() {
   done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$manifest_path")
 }
 
-pull_components "$1"
+parse_args "$@"
+pull_components "$MANIFEST_PATH"
