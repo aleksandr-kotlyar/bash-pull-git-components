@@ -6,6 +6,7 @@ GIT_BASE_URL="${GIT_BASE_URL:-}"
 DRY_RUN=false
 MANIFEST_PATH=""
 CONTINUE_ON_ERROR=false
+JOBS=1
 TOTAL_REPOS=0
 SUCCESS_REPOS=0
 FAILED_REPOS=0
@@ -40,7 +41,7 @@ run_step() {
 print_help() {
   cat <<'EOF'
 Usage:
-  pull.sh --manifest <path> [--base-url <git-base-url>] [--default-branch <branch>] [--dry-run] [--continue-on-error]
+  pull.sh --manifest <path> [--base-url <git-base-url>] [--default-branch <branch>] [--dry-run] [--continue-on-error] [--jobs <num>]
   pull.sh <manifest-path>
 
 Options:
@@ -49,6 +50,7 @@ Options:
   --default-branch <name>   Fallback branch when origin/HEAD is unavailable (default: master).
   --dry-run                 Print actions without running git commands.
   --continue-on-error       Continue processing other repos and print summary at the end.
+  --jobs <num>              Number of repositories to process in parallel (default: 1).
   -h, --help                Show this help message.
 EOF
 }
@@ -79,6 +81,11 @@ parse_args() {
         CONTINUE_ON_ERROR=true
         shift
         ;;
+      --jobs)
+        [[ $# -lt 2 ]] && fail "cli" "parse-args" "Missing value for --jobs"
+        JOBS=$2
+        shift 2
+        ;;
       -h|--help)
         print_help
         exit 0
@@ -98,6 +105,15 @@ parse_args() {
   done
 }
 
+validate_args() {
+  if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
+    fail "cli" "validate-args" "--jobs must be a positive integer"
+  fi
+  if [[ "$JOBS" -lt 1 ]]; then
+    fail "cli" "validate-args" "--jobs must be >= 1"
+  fi
+}
+
 record_failure() {
   local repo=$1
   local step=$2
@@ -112,6 +128,17 @@ print_summary() {
     echo "Failed repos:"
     printf "%s" "$FAILED_LIST"
   fi
+}
+
+wait_for_slot() {
+  while true; do
+    local running
+    running=$(jobs -rp | wc -l | tr -d ' ')
+    if [[ "$running" -lt "$JOBS" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
 }
 
 sync_repo() {
@@ -160,6 +187,10 @@ pull_components() {
   local manifest_path=${1:-}
   local repo
   local ref
+  local -a pids=()
+  local -a pid_repos=()
+  local pid
+  local i
 
   if [[ -z "$manifest_path" ]]; then
     echo "Usage: $0 <components.json>" >&2
@@ -176,6 +207,10 @@ pull_components() {
     return 2
   fi
 
+  if [[ "$JOBS" -gt 1 && "$CONTINUE_ON_ERROR" != "true" ]]; then
+    echo "Warning: --jobs > 1 works best with --continue-on-error; failures are reported after all running jobs complete." >&2
+  fi
+
   while IFS=$'\t' read -r repo ref; do
     if [[ -z "$repo" ]]; then
       continue
@@ -183,16 +218,47 @@ pull_components() {
 
     TOTAL_REPOS=$((TOTAL_REPOS + 1))
     echo "repo=$repo ref=${ref:-$DEFAULT_BRANCH}"
-    if sync_repo "$repo" "$ref"; then
-      SUCCESS_REPOS=$((SUCCESS_REPOS + 1))
-    else
-      record_failure "$repo" "sync"
-      if [[ "$CONTINUE_ON_ERROR" != "true" ]]; then
-        exit 1
+
+    if [[ "$JOBS" -eq 1 ]]; then
+      if sync_repo "$repo" "$ref"; then
+        SUCCESS_REPOS=$((SUCCESS_REPOS + 1))
+      else
+        record_failure "$repo" "sync"
+        if [[ "$CONTINUE_ON_ERROR" != "true" ]]; then
+          exit 1
+        fi
+        echo "[$repo] continue-on-error enabled, moving to next repository" >&2
       fi
-      echo "[$repo] continue-on-error enabled, moving to next repository" >&2
+      continue
     fi
+
+    wait_for_slot
+    (
+      sync_repo "$repo" "$ref"
+    ) &
+    pid=$!
+    pids+=("$pid")
+    pid_repos+=("$repo")
   done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$manifest_path")
+
+  if [[ "$JOBS" -gt 1 ]]; then
+    for i in "${!pids[@]}"; do
+      pid=${pids[$i]}
+      repo=${pid_repos[$i]}
+      if wait "$pid"; then
+        SUCCESS_REPOS=$((SUCCESS_REPOS + 1))
+      else
+        record_failure "$repo" "sync"
+        if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
+          echo "[$repo] continue-on-error enabled, moving to next repository" >&2
+        fi
+      fi
+    done
+
+    if [[ "$FAILED_REPOS" -gt 0 && "$CONTINUE_ON_ERROR" != "true" ]]; then
+      echo "Error: one or more repositories failed. Re-run with --continue-on-error for full report." >&2
+    fi
+  fi
 
   print_summary
   if [[ $FAILED_REPOS -gt 0 ]]; then
@@ -201,4 +267,5 @@ pull_components() {
 }
 
 parse_args "$@"
+validate_args
 pull_components "$MANIFEST_PATH"
